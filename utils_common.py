@@ -15,19 +15,22 @@ import numpy as np
 from tqdm import tqdm
 
 
-def load_images(images_path: str, test_ratio: float = 0.2, batch_size: int = 32, shuffle: bool = True):
+def load_images(images_path: str, train_ratio=0.7, val_ratio=0.1, test_ratio=0.2, batch_size: int = 32, shuffle: bool = True):
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
-
+    
+    torch.manual_seed(42) 
+    
     data = datasets.ImageFolder(root=images_path, transform=transform)
     data_loader = DataLoader(data, batch_size=32, shuffle=shuffle)
-
-    train_data, test_data = random_split(data, [1 - test_ratio, test_ratio])
+    
+    train_data, test_data , validation_data = random_split(data, [train_ratio, test_ratio, val_ratio])
     train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=shuffle)
     test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=shuffle)
+    validation_loader = DataLoader(validation_data, batch_size=batch_size, shuffle=shuffle)
 
     return data, train_loader, test_loader
 
