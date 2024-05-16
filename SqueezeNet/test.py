@@ -20,7 +20,7 @@ import utils_common
 import time
 import pandas as pd
 import numpy as np
-from squeezeNetGranCam import GradCAM
+from squeezeNetGradCam import GradCAM
 
 if __name__ == "__main__":
     transform = transforms.Compose([
