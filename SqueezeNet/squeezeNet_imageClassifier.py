@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 from torchvision.models.feature_extraction import get_graph_node_names
 from torchvision.models.feature_extraction import create_feature_extractor
 from torchvision.models.detection.backbone_utils import LastLevelMaxPool#
-from squeezeNetGranCam import GradCAM
+from squeezeNetGradCam import GradCAM
 
 class ImageClassifier:
     
