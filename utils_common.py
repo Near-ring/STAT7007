@@ -20,6 +20,7 @@ def load_images(images_path: str, train_ratio=0.7, test_ratio=0.2, batch_size: i
     base_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
     ])
 
     augmented_transform = transforms.Compose([
@@ -27,6 +28,7 @@ def load_images(images_path: str, train_ratio=0.7, test_ratio=0.2, batch_size: i
         transforms.RandomHorizontalFlip(),
         transforms.RandomRotation(90),
         transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
     ])
 
     torch.manual_seed(42)

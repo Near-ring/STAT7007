@@ -13,22 +13,22 @@ data, train_loader, test_loader = load_images('./images', test_ratio=0.2, batch_
 
 num_classes = len(data.classes)
 # model = torchvision.models.MNASNet(alpha=1.0, num_classes=num_classes)
-model = torchvision.models.vgg16(weights=None, num_classes=num_classes)
+# model = torchvision.models.vgg16(weights=None, num_classes=num_classes)
 # model = torchvision.models.MobileNetV2(num_classes=num_classes)
 # model = torchvision.models.resnet34(weights=None, num_classes=num_classes)
 # model = torchvision.models.shufflenet_v2_x1_0(weights=None)
 # model.fc = nn.Linear(model.fc.in_features, num_classes)
-# model = torchvision.models.squeezenet1_0(weights=None)
+model = torchvision.models.squeezenet1_0(weights=None)
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 # cam = GradCAM(model)
 
-model_name = 'vgg16'
+model_name = 'squeezenet'
 
-num_epochs = 17
-train_losses, train_accs = train_model(model, train_loader, optimizer, num_epochs)
-torch.save(model.state_dict(), f'{model_name}.pth')
-test_report(model, f'{model_name}.pth', test_loader, data)
-eval_model(model, test_loader)
+# num_epochs = 17
+# train_losses, train_accs = train_model(model, train_loader, optimizer, num_epochs)
+# torch.save(model.state_dict(), f'{model_name}.pth')
+# test_report(model, f'{model_name}.pth', test_loader, data)
+# eval_model(model, test_loader)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.load_state_dict(torch.load(f'{model_name}.pth'))
