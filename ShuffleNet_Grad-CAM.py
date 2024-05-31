@@ -1,118 +1,285 @@
-import torch
-import torch.nn as nn
-import torchvision
-from torchvision import transforms, datasets
-from torch.utils.data import DataLoader
+import os
 import numpy as np
-from torch import Tensor
-import torch.nn.functional as F
+import torch
 from PIL import Image
-from matplotlib import cm
+import matplotlib.pyplot as plt
+from torchvision import models
+from torchvision import transforms
+import cv2
+from PIL import Image
 import random
 
 
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-])
+class ActivationsAndGradients:
+    """ Class for extracting activations and
+    registering gradients from targeted intermediate layers """
 
-# Load data
-data = datasets.ImageFolder(root='./images', transform=transform)
-data_loader = DataLoader(data, batch_size=32, shuffle=True)
+    def __init__(self, model, target_layers, reshape_transform):
+        self.model = model
+        self.gradients = []
+        self.activations = []
+        self.reshape_transform = reshape_transform
+        self.handles = []
+        for target_layer in target_layers:
+            self.handles.append(
+                target_layer.register_forward_hook(
+                    self.save_activation))
+            # Backward compatibility with older pytorch versions:
+            if hasattr(target_layer, 'register_full_backward_hook'):
+                self.handles.append(
+                    target_layer.register_full_backward_hook(
+                        self.save_gradient))
+            else:
+                self.handles.append(
+                    target_layer.register_backward_hook(
+                        self.save_gradient))
 
-# Import pre-trained model
-model = torchvision.models.shufflenet_v2_x1_0(weights=None)
+    def save_activation(self, module, input, output):
+        activation = output
+        if self.reshape_transform is not None:
+            activation = self.reshape_transform(activation)
+        self.activations.append(activation.cpu().detach())
 
-num_classes = len(data.classes)
-model.fc = nn.Linear(1024, num_classes)
+    def save_gradient(self, module, grad_input, grad_output):
+        # Gradients are computed in reverse order
+        grad = grad_output[0]
+        if self.reshape_transform is not None:
+            grad = self.reshape_transform(grad)
+        self.gradients = [grad.cpu().detach()] + self.gradients
 
-state_dict = torch.load('./shufflenet_model.pth')
-model.load_state_dict(state_dict)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(device)
-model.eval()
+    def __call__(self, x):
+        self.gradients = []
+        self.activations = []
+        return self.model(x)
 
-feature_map = []  
-
-
-def forward_hook(module, inp, outp):
-    feature_map.append(outp)
-
-
-# Register forward hook for the last layer
-for module in model.children():
-    if isinstance(module, nn.Conv2d):
-        module.register_forward_hook(forward_hook)
-        break  
-
-grad = []  
-
-def backward_hook(module, grad_in, grad_out):
-    grad.append(grad_out[0])
-
-
-# Register backward hook for the last layer
-for module in model.children():
-    if isinstance(module, nn.Conv2d):
-        module.register_backward_hook(backward_hook)
-        break  
-
-def _normalize(cams: Tensor) -> Tensor:
-    """CAM normalization"""
-    cams.sub_(cams.flatten(start_dim=-2).min(-1).values.unsqueeze(-1).unsqueeze(-1))
-    cams.div_(cams.flatten(start_dim=-2).max(-1).values.unsqueeze(-1).unsqueeze(-1))
-
-    return cams
-
-def overlay_mask(img: Image.Image, mask: Tensor, colormap: str = 'jet', alpha: float = 0.6) -> Image.Image:
-    if not isinstance(img, Image.Image):
-        raise TypeError('img argument needs to be a PIL.Image')
-
-    if not isinstance(alpha, float) or alpha < 0 or alpha >= 1:
-        raise ValueError('alpha argument is expected to be of type float between 0 and 1')
-
-    cmap = cm.get_cmap(colormap)
-    # Resize mask and apply colormap
-    overlay = mask.detach().numpy()
-    overlay = (255 * cmap(overlay ** 2)[:, :, 1:]).astype(np.uint8)
-    # Overlay the image with the mask
-    overlayed_img = Image.fromarray((alpha * np.asarray(img) + (1 - alpha) * overlay).astype(np.uint8))
-
-    return overlayed_img
+    def release(self):
+        for handle in self.handles:
+            handle.remove()
 
 
-with torch.no_grad():
-    for images, labels in data_loader:
-        images, labels = images.to(device), labels.to(device)
+class GradCAM:
+    def __init__(self,
+                 model,
+                 target_layers,
+                 reshape_transform=None,
+                 use_cuda=False):
+        self.model = model.eval()
+        self.target_layers = target_layers
+        self.reshape_transform = reshape_transform
+        self.cuda = use_cuda
+        if self.cuda:
+            self.model = model.cuda()
+        self.activations_and_grads = ActivationsAndGradients(
+            self.model, target_layers, reshape_transform)
 
-        idx = random.randint(0, len(images) - 1)
-        sample_image = images[idx]
-        sample_label = labels[idx]
+    @staticmethod
+    def get_cam_weights(grads):
+        return np.mean(grads, axis=(2, 3), keepdims=True)
 
-        outputs = model(images)
+    @staticmethod
+    def get_loss(output, target_category):
+        loss = 0
+        for i in range(len(target_category)):
+            loss = loss + output[i, target_category[i]]
+        return loss
 
-        orign_img = transforms.ToPILImage()(sample_image.cpu())  # Convert tensor to PIL Image
+    def get_cam_image(self, activations, grads):
+        weights = self.get_cam_weights(grads)
+        weighted_activations = weights * activations
+        cam = weighted_activations.sum(axis=1)
 
-        out = model(images)  
-        cls_idx = torch.argmax(out).item()  
-        score = out[:, cls_idx].sum()  
+        return cam
 
-        with torch.enable_grad():
-            model.zero_grad()
-            score.backward(retain_graph=True)  
+    @staticmethod
+    def get_target_width_height(input_tensor):
+        width, height = input_tensor.size(-1), input_tensor.size(-2)
+        return width, height
 
-        weights = grad[0].squeeze(0).mean(dim=(1, 2)) 
+    def compute_cam_per_layer(self, input_tensor):
+        activations_list = [a.cpu().data.numpy()
+                            for a in self.activations_and_grads.activations]
+        grads_list = [g.cpu().data.numpy()
+                      for g in self.activations_and_grads.gradients]
+        target_size = self.get_target_width_height(input_tensor)
 
-        grad_cam = (weights.view(*weights.shape, 1, 1) * feature_map[0].squeeze(0)).sum(0)
-        grad_cam = _normalize(F.relu(grad_cam, inplace=True)).cpu()
-        mask = grad_cam
-        result = overlay_mask(orign_img, mask)
-        result.show()
+        cam_per_target_layer = []
+        # Loop over the saliency image from every layer
+
+        for layer_activations, layer_grads in zip(activations_list, grads_list):
+            cam = self.get_cam_image(layer_activations, layer_grads)
+            cam[cam < 0] = 0  # works like mute the min-max scale in the function of scale_cam_image
+            scaled = self.scale_cam_image(cam, target_size)
+            cam_per_target_layer.append(scaled[:, None, :])
+
+        return cam_per_target_layer
+
+    def aggregate_multi_layers(self, cam_per_target_layer):
+        cam_per_target_layer = np.concatenate(cam_per_target_layer, axis=1)
+        cam_per_target_layer = np.maximum(cam_per_target_layer, 0)
+        result = np.mean(cam_per_target_layer, axis=1)
+        return self.scale_cam_image(result)
+
+    @staticmethod
+    def scale_cam_image(cam, target_size=None):
+        result = []
+        for img in cam:
+            img = img - np.min(img)
+            img = img / (1e-7 + np.max(img))
+            if target_size is not None:
+                img = cv2.resize(img, target_size)
+            result.append(img)
+        result = np.float32(result)
+
+        return result
+
+    def __call__(self, input_tensor, target_category=None):
+
+        if self.cuda:
+            input_tensor = input_tensor.cuda()
+
+        output = self.activations_and_grads(input_tensor)
+        if isinstance(target_category, int):
+            target_category = [target_category] * input_tensor.size(0)
+
+        if target_category is None:
+            target_category = np.argmax(output.cpu().data.numpy(), axis=-1)
+            print(f"category id: {target_category}")
+        else:
+            assert (len(target_category) == input_tensor.size(0))
+
+        self.model.zero_grad()
+        loss = self.get_loss(output, target_category)
+        loss.backward(retain_graph=True)
+
+        cam_per_layer = self.compute_cam_per_layer(input_tensor)
+        return self.aggregate_multi_layers(cam_per_layer)
+
+    def __del__(self):
+        self.activations_and_grads.release()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_tb):
+        self.activations_and_grads.release()
+        if isinstance(exc_value, IndexError):
+            # Handle IndexError here...
+            print(f"An exception occurred in CAM with block: {exc_type}. Message: {exc_value}")
+            return True
 
 
+def show_cam_on_image(img: np.ndarray,
+                      mask: np.ndarray,
+                      use_rgb: bool = False,
+                      colormap: int = cv2.COLORMAP_JET) -> np.ndarray:
+    """ This function overlays the cam mask on the image as an heatmap.
+    By default the heatmap is in BGR format.
+
+    :param img: The base image in RGB or BGR format.
+    :param mask: The cam mask.
+    :param use_rgb: Whether to use an RGB or BGR heatmap, this should be set to True if 'img' is in RGB format.
+    :param colormap: The OpenCV colormap to be used.
+    :returns: The default image with the cam overlay.
+    """
+
+    heatmap = cv2.applyColorMap(np.uint8(255 * mask), colormap)
+    if use_rgb:
+        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+    heatmap = np.float32(heatmap) / 255
+
+    if np.max(img) > 1:
+        raise Exception("The input image should np.float32 in the range [0, 1]")
+
+    cam = heatmap + img
+    cam = cam / np.max(cam)
+    return np.uint8(255 * cam)
 
 
+def center_crop_img(img: np.ndarray, size: int):
+    h, w, c = img.shape
+
+    if w == h == size:
+        return img
+
+    if w < h:
+        ratio = size / w
+        new_w = size
+        new_h = int(h * ratio)
+    else:
+        ratio = size / h
+        new_h = size
+        new_w = int(w * ratio)
+
+    img = cv2.resize(img, dsize=(new_w, new_h))
+
+    if new_w == size:
+        h = (new_h - size) // 2
+        img = img[h: h+size]
+    else:
+        w = (new_w - size) // 2
+        img = img[:, w: w+size]
+
+    return img
+
+def load_custom_model(model_path, num_classes):
+    model = models.shufflenet_v2_x1_0(pretrained=False)
+    num_ftrs = model.fc.in_features
+    model.fc = torch.nn.Linear(num_ftrs, num_classes)
+    model.load_state_dict(torch.load(model_path))
+    model.eval()
+    return model
 
 
+def random_images_from_folder(folder_path, num_images):
+    file_names = os.listdir(folder_path)
+    random_files = random.sample(file_names, num_images)
+    return [os.path.join(folder_path, file_name) for file_name in random_files]
 
+random_image_paths = random_images_from_folder('./images/inclusion' , 5)
+
+
+def main():
+    
+    model_path = './shuffle_model_best.pth'
+    num_classes = 10 
+    model = load_custom_model(model_path, num_classes)
+    target_layers = [model.conv5] 
+    
+
+    data_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+    
+    for image_path in random_image_paths:
+    
+        img = Image.open(image_path).convert('RGB')  
+
+        img_tensor = data_transform(img)
+        input_tensor = torch.unsqueeze(img_tensor, dim=0)
+
+        cam = GradCAM(model=model, target_layers=target_layers, use_cuda=False)
+        target_category = 1  
+
+        grayscale_cam = cam(input_tensor=input_tensor, target_category=target_category)
+        grayscale_cam = grayscale_cam[0, :]
+        grayscale_cam_resized = cv2.resize(grayscale_cam, (2048, 1000))
+
+        visualization = show_cam_on_image(np.array(img).astype(dtype=np.uint8) / 255.,
+                                      grayscale_cam_resized,
+                                      use_rgb=True)
+        
+        fig,(ax1, ax2) = plt.subplots(1, 2)
+        
+        ax1.imshow(visualization)
+        ax2.imshow(img)
+        
+        plt.show()
+
+
+if __name__ == '__main__':
+    main()
+    
+    
+    

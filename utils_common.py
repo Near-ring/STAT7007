@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torchvision
 from torchvision import transforms, datasets
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.data import random_split
 
 from sklearn.metrics import classification_report
@@ -15,24 +15,46 @@ import numpy as np
 from tqdm import tqdm
 
 
-def load_images(images_path: str, train_ratio=0.7, val_ratio=0.1, test_ratio=0.2, batch_size: int = 32, shuffle: bool = True):
-    transform = transforms.Compose([
+def load_images(images_path: str, train_ratio=0.7, test_ratio=0.2, batch_size: int = 32,
+                shuffle: bool = True, augment: bool = False):
+    base_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
     ])
-    
-    torch.manual_seed(42) 
-    
-    data = datasets.ImageFolder(root=images_path, transform=transform)
-    data_loader = DataLoader(data, batch_size=32, shuffle=shuffle)
-    
-    train_data, test_data , validation_data = random_split(data, [train_ratio, test_ratio, val_ratio])
-    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=shuffle)
-    test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=shuffle)
-    validation_loader = DataLoader(validation_data, batch_size=batch_size, shuffle=shuffle)
 
-    return data, train_loader, test_loader
+    augmented_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(90),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
+
+    torch.manual_seed(42)
+
+    dataset = datasets.ImageFolder(root=images_path, transform=base_transform)
+
+    # Split dataset into train and test
+    train_size = int(train_ratio * len(dataset))
+    test_size = len(dataset) - train_size
+    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+
+    # Apply augmentations to the training dataset
+    augmented_train_dataset = datasets.ImageFolder(root=images_path, transform=augmented_transform)
+
+    # Combine original and augmented training datasets
+    combined_train_dataset = ConcatDataset([train_dataset, augmented_train_dataset])
+
+    # Create data loaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle)
+    train_loader_aug = DataLoader(combined_train_dataset, batch_size=batch_size, shuffle=shuffle)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=shuffle)
+
+    if augment:
+        return dataset, train_loader_aug, test_loader
+    else:
+        return dataset, train_loader, test_loader
 
 
 def train_model(model, train_loader, optimizer: torch.optim, num_epochs):
